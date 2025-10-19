@@ -5,6 +5,8 @@ import { renderer } from './renderer'
 
 type Bindings = {
   DB: D1Database
+  NATIONAL_GRID_API_KEY?: string
+  UKPN_API_KEY?: string
 }
 
 const app = new Hono<{ Bindings: Bindings }>()
@@ -365,6 +367,128 @@ app.get('/api/external/ukpn/substations', async (c) => {
 })
 
 /**
+ * GET /api/external/nationalgrid/substations
+ * Fetch live substation data from National Grid Connected Data Portal
+ * Uses CKAN API format with Bearer token authentication
+ */
+app.get('/api/external/nationalgrid/substations', async (c) => {
+  const db = c.env.DB
+  const { bounds, minCapacity, refresh } = c.req.query()
+  const apiKey = c.env.NATIONAL_GRID_API_KEY
+  
+  if (!apiKey) {
+    return c.json({
+      success: false,
+      error: 'National Grid API key not configured',
+      hint: 'Add NATIONAL_GRID_API_KEY to .dev.vars or Cloudflare secrets'
+    }, 500)
+  }
+  
+  // Cache key based on query parameters
+  const cacheKey = `nationalgrid_substations_${bounds || 'all'}_${minCapacity || 'any'}`
+  
+  // Check cache first (unless refresh=true)
+  if (refresh !== 'true') {
+    const cached = await db.prepare(`
+      SELECT response_data, created_at 
+      FROM api_cache 
+      WHERE cache_key = ? 
+        AND datetime(created_at, '+24 hours') > datetime('now')
+    `).bind(cacheKey).first()
+    
+    if (cached) {
+      return c.json({
+        success: true,
+        data: JSON.parse(cached.response_data),
+        cached: true,
+        cached_at: cached.created_at
+      })
+    }
+  }
+  
+  try {
+    // National Grid uses CKAN API - distribution-substations dataset
+    const resourceId = '2d95d878-7eb0-4ed4-9be3-4ac926aaf134'
+    const ngUrl = `https://connecteddata.nationalgrid.co.uk/api/3/action/datastore_search`
+    
+    // Build query parameters
+    const params = new URLSearchParams({
+      resource_id: resourceId,
+      limit: '100'
+    })
+    
+    const fullUrl = `${ngUrl}?${params.toString()}`
+    
+    // Fetch from National Grid API with Bearer token
+    const response = await fetch(fullUrl, {
+      headers: {
+        'Accept': 'application/json',
+        'Authorization': `Bearer ${apiKey}`,
+        'User-Agent': 'HGV-Charging-Site-Selector/1.0'
+      }
+    })
+    
+    if (!response.ok) {
+      throw new Error(`National Grid API error: ${response.status} ${response.statusText}`)
+    }
+    
+    const apiData = await response.json()
+    
+    if (!apiData.success || !apiData.result || !apiData.result.records) {
+      throw new Error('Invalid response format from National Grid API')
+    }
+    
+    // Transform National Grid CKAN data structure to our schema
+    const transformedData = apiData.result.records.map((record: any) => {
+      return {
+        name: record['Substation Name'] || record['Site Name'] || 'Unknown',
+        voltage_level: record['Voltage Level'] || record['Primary Voltage'] || 'Unknown',
+        capacity_mw: parseFloat(record['Capacity MW'] || record['Installed Capacity'] || 0),
+        latitude: parseFloat(record['Latitude'] || record['lat'] || 0),
+        longitude: parseFloat(record['Longitude'] || record['lon'] || record['long'] || 0),
+        dno_operator: 'National Grid',
+        available_capacity_mw: parseFloat(record['Available Capacity'] || record['Headroom'] || 0),
+        connection_type: record['Connection Type'] || 'Distribution',
+        data_source: 'NationalGrid_Live_API',
+        last_updated: new Date().toISOString()
+      }
+    }).filter((item: any) => 
+      item.latitude && item.longitude && (!minCapacity || item.capacity_mw >= parseFloat(minCapacity))
+    )
+    
+    // Cache the transformed data
+    await db.prepare(`
+      INSERT OR REPLACE INTO api_cache (
+        cache_key, api_source, endpoint, response_data, created_at
+      ) VALUES (?, ?, ?, ?, datetime('now'))
+    `).bind(
+      cacheKey,
+      'National Grid',
+      fullUrl,
+      JSON.stringify(transformedData)
+    ).run()
+    
+    return c.json({
+      success: true,
+      data: transformedData,
+      cached: false,
+      count: transformedData.length,
+      total: apiData.result.total || transformedData.length,
+      source: 'National Grid Connected Data Portal',
+      api_url: fullUrl
+    })
+    
+  } catch (error: any) {
+    console.error('Error fetching National Grid data:', error)
+    return c.json({
+      success: false,
+      error: error.message,
+      fallback: 'Using cached or seed data'
+    }, 500)
+  }
+})
+
+/**
  * GET /api/substations/live
  * Combined endpoint that fetches from multiple DNO sources
  * Falls back to database seed data if APIs fail
@@ -374,9 +498,18 @@ app.get('/api/substations/live', async (c) => {
   const { bounds, minCapacity } = c.req.query()
   
   try {
-    // Fetch from UK Power Networks (primary source)
-    const ukpnResponse = await fetch(`${c.req.url.replace('/api/substations/live', '/api/external/ukpn/substations')}?${new URLSearchParams(c.req.query() as any).toString()}`)
-    const ukpnData = await ukpnResponse.json()
+    // Fetch from multiple DNO sources in parallel
+    const baseUrl = c.req.url.replace('/api/substations/live', '')
+    const queryString = new URLSearchParams(c.req.query() as any).toString()
+    
+    const [ukpnResponse, ngResponse] = await Promise.all([
+      fetch(`${baseUrl}/api/external/ukpn/substations?${queryString}`).catch(() => null),
+      fetch(`${baseUrl}/api/external/nationalgrid/substations?${queryString}`).catch(() => null)
+    ])
+    
+    // Parse responses
+    const ukpnData = ukpnResponse ? await ukpnResponse.json() : { success: false, data: [] }
+    const ngData = ngResponse ? await ngResponse.json() : { success: false, data: [] }
     
     // Combine with local database substations
     let query = 'SELECT * FROM substations WHERE 1=1'
@@ -389,9 +522,10 @@ app.get('/api/substations/live', async (c) => {
     
     const dbResult = await db.prepare(query).bind(...params).all()
     
-    // Merge results
+    // Merge all results
     const allSubstations = [
       ...(ukpnData.success ? ukpnData.data : []),
+      ...(ngData.success ? ngData.data : []),
       ...(dbResult.results || [])
     ]
     
@@ -401,6 +535,7 @@ app.get('/api/substations/live', async (c) => {
       count: allSubstations.length,
       sources: {
         ukpn_live: ukpnData.success ? ukpnData.data.length : 0,
+        nationalgrid_live: ngData.success ? ngData.data.length : 0,
         database: dbResult.results?.length || 0
       }
     })
