@@ -246,6 +246,188 @@ app.get('/api/saved-analyses', async (c) => {
 })
 
 // ============================================================================
+// LIVE DNO API INTEGRATION
+// ============================================================================
+
+/**
+ * GET /api/external/ukpn/substations
+ * Fetch live substation data from UK Power Networks Open Data Portal
+ * Implements caching strategy to reduce API calls
+ */
+app.get('/api/external/ukpn/substations', async (c) => {
+  const db = c.env.DB
+  const { bounds, minCapacity, refresh } = c.req.query()
+  
+  // Cache key based on query parameters
+  const cacheKey = `ukpn_substations_${bounds || 'all'}_${minCapacity || 'any'}`
+  
+  // Check cache first (unless refresh=true)
+  if (refresh !== 'true') {
+    const cached = await db.prepare(`
+      SELECT response_data, created_at 
+      FROM api_cache 
+      WHERE cache_key = ? 
+        AND datetime(created_at, '+24 hours') > datetime('now')
+    `).bind(cacheKey).first()
+    
+    if (cached) {
+      return c.json({
+        success: true,
+        data: JSON.parse(cached.response_data),
+        cached: true,
+        cached_at: cached.created_at
+      })
+    }
+  }
+  
+  try {
+    // Build UK Power Networks API URL
+    // API docs: https://ukpowernetworks.opendatasoft.com/api/v1/console
+    let ukpnUrl = 'https://ukpowernetworks.opendatasoft.com/api/explore/v2.1/catalog/datasets/grid-and-primary-sites/records'
+    
+    // Add query parameters
+    const params = new URLSearchParams({
+      limit: '100',
+      offset: '0'
+    })
+    
+    // Add spatial filter if bounds provided (format: minLat,minLon,maxLat,maxLon)
+    if (bounds) {
+      const [minLat, minLon, maxLat, maxLon] = bounds.split(',').map(parseFloat)
+      // OpenDataSoft uses geofilter.bbox parameter
+      params.append('where', `within_bbox(geo_point_2d, ${maxLat}, ${minLon}, ${minLat}, ${maxLon})`)
+    }
+    
+    const fullUrl = `${ukpnUrl}?${params.toString()}`
+    
+    // Fetch from UK Power Networks API
+    const response = await fetch(fullUrl, {
+      headers: {
+        'Accept': 'application/json',
+        'User-Agent': 'HGV-Charging-Site-Selector/1.0'
+      }
+    })
+    
+    if (!response.ok) {
+      throw new Error(`UK Power Networks API error: ${response.status} ${response.statusText}`)
+    }
+    
+    const apiData = await response.json()
+    
+    // Transform UKPN data structure to our schema
+    const transformedData = apiData.records?.map((record: any) => {
+      const fields = record.record.fields
+      return {
+        name: fields.site_name || fields.site_ref || 'Unknown',
+        voltage_level: fields.voltage_level || fields.nominal_voltage || 'Unknown',
+        capacity_mw: parseFloat(fields.generation_headroom_mva || fields.demand_headroom_mva || 0),
+        latitude: fields.geo_point_2d?.lat || record.geometry?.coordinates[1],
+        longitude: fields.geo_point_2d?.lon || record.geometry?.coordinates[0],
+        dno_operator: 'UK Power Networks',
+        available_capacity_mw: parseFloat(fields.generation_headroom_mva || 0),
+        connection_type: fields.connection_type || 'Distribution',
+        data_source: 'UKPN_Live_API',
+        last_updated: new Date().toISOString()
+      }
+    }).filter((item: any) => 
+      item.latitude && item.longitude && (!minCapacity || item.capacity_mw >= parseFloat(minCapacity))
+    ) || []
+    
+    // Cache the transformed data
+    await db.prepare(`
+      INSERT OR REPLACE INTO api_cache (
+        cache_key, api_source, endpoint, response_data, created_at
+      ) VALUES (?, ?, ?, ?, datetime('now'))
+    `).bind(
+      cacheKey,
+      'UK Power Networks',
+      fullUrl,
+      JSON.stringify(transformedData)
+    ).run()
+    
+    return c.json({
+      success: true,
+      data: transformedData,
+      cached: false,
+      count: transformedData.length,
+      source: 'UK Power Networks Open Data Portal',
+      api_url: fullUrl
+    })
+    
+  } catch (error: any) {
+    console.error('Error fetching UKPN data:', error)
+    return c.json({
+      success: false,
+      error: error.message,
+      fallback: 'Using cached or seed data'
+    }, 500)
+  }
+})
+
+/**
+ * GET /api/substations/live
+ * Combined endpoint that fetches from multiple DNO sources
+ * Falls back to database seed data if APIs fail
+ */
+app.get('/api/substations/live', async (c) => {
+  const db = c.env.DB
+  const { bounds, minCapacity } = c.req.query()
+  
+  try {
+    // Fetch from UK Power Networks (primary source)
+    const ukpnResponse = await fetch(`${c.req.url.replace('/api/substations/live', '/api/external/ukpn/substations')}?${new URLSearchParams(c.req.query() as any).toString()}`)
+    const ukpnData = await ukpnResponse.json()
+    
+    // Combine with local database substations
+    let query = 'SELECT * FROM substations WHERE 1=1'
+    const params: any[] = []
+    
+    if (minCapacity) {
+      query += ' AND capacity_mw >= ?'
+      params.push(parseFloat(minCapacity))
+    }
+    
+    const dbResult = await db.prepare(query).bind(...params).all()
+    
+    // Merge results
+    const allSubstations = [
+      ...(ukpnData.success ? ukpnData.data : []),
+      ...(dbResult.results || [])
+    ]
+    
+    return c.json({
+      success: true,
+      data: allSubstations,
+      count: allSubstations.length,
+      sources: {
+        ukpn_live: ukpnData.success ? ukpnData.data.length : 0,
+        database: dbResult.results?.length || 0
+      }
+    })
+    
+  } catch (error: any) {
+    // Fallback to database only
+    let query = 'SELECT * FROM substations WHERE 1=1'
+    const params: any[] = []
+    
+    if (minCapacity) {
+      query += ' AND capacity_mw >= ?'
+      params.push(parseFloat(minCapacity))
+    }
+    
+    const result = await db.prepare(query).bind(...params).all()
+    
+    return c.json({
+      success: true,
+      data: result.results,
+      count: result.results?.length || 0,
+      fallback: true,
+      error: error.message
+    })
+  }
+})
+
+// ============================================================================
 // FRONTEND ROUTE
 // ============================================================================
 
