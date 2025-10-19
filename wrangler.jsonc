@@ -1,34 +1,22 @@
 {
   "$schema": "node_modules/wrangler/config-schema.json",
-  "name": "webapp-project",
+  "name": "hgv-charging-sites",
   "compatibility_date": "2025-10-19",
   "pages_build_output_dir": "./dist",
   "compatibility_flags": [
     "nodejs_compat"
+  ],
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "hgv-charging-sites-production",
+      "database_id": "PLACEHOLDER_DATABASE_ID"
+    }
   ]
-  // "vars": {
-  //   "MY_VAR": "my-variable"
-  // },
-  // "kv_namespaces": [
-  //   {
-  //     "binding": "MY_KV_NAMESPACE",
-  //     "id": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
-  //   }
-  // ],
-  // "r2_buckets": [
-  //   {
-  //     "binding": "MY_BUCKET",
-  //     "bucket_name": "my-bucket"
-  //   }
-  // ],
-  // "d1_databases": [
-  //   {
-  //     "binding": "MY_DB",
-  //     "database_name": "my-database",
-  //     "database_id": ""
-  //   }
-  // ],
-  // "ai": {
-  //   "binding": "AI"
-  // }
+  // To create the database, run:
+  // npx wrangler d1 create hgv-charging-sites-production
+  // Then update the database_id above with the ID from the output
+  
+  // For local development with --local flag, wrangler automatically
+  // creates a local SQLite database at .wrangler/state/v3/d1/
 }
