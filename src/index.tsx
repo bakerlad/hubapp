@@ -338,12 +338,11 @@ app.get('/api/external/ukpn/substations', async (c) => {
     // Cache the transformed data
     await db.prepare(`
       INSERT OR REPLACE INTO api_cache (
-        cache_key, api_source, endpoint, response_data, created_at
-      ) VALUES (?, ?, ?, ?, datetime('now'))
+        cache_key, api_source, response_data, created_at
+      ) VALUES (?, ?, ?, datetime('now'))
     `).bind(
       cacheKey,
       'UK Power Networks',
-      fullUrl,
       JSON.stringify(transformedData)
     ).run()
     
@@ -459,12 +458,11 @@ app.get('/api/external/nationalgrid/substations', async (c) => {
     // Cache the transformed data
     await db.prepare(`
       INSERT OR REPLACE INTO api_cache (
-        cache_key, api_source, endpoint, response_data, created_at
-      ) VALUES (?, ?, ?, ?, datetime('now'))
+        cache_key, api_source, response_data, created_at
+      ) VALUES (?, ?, ?, datetime('now'))
     `).bind(
       cacheKey,
       'National Grid',
-      fullUrl,
       JSON.stringify(transformedData)
     ).run()
     
@@ -561,6 +559,199 @@ app.get('/api/substations/live', async (c) => {
     })
   }
 })
+
+/**
+ * GET /api/external/webtris/sites
+ * Fetch live traffic monitoring sites from National Highways WebTRIS API
+ * No authentication required - public API
+ */
+app.get('/api/external/webtris/sites', async (c) => {
+  const db = c.env.DB
+  const { bounds, minHGV, refresh, status } = c.req.query()
+  
+  // Cache key based on query parameters
+  const cacheKey = `webtris_sites_${bounds || 'all'}_${minHGV || 'any'}_${status || 'all'}`
+  
+  // Check cache first (unless refresh=true)
+  if (refresh !== 'true') {
+    const cached = await db.prepare(`
+      SELECT response_data, created_at 
+      FROM api_cache 
+      WHERE cache_key = ? 
+        AND datetime(created_at, '+7 days') > datetime('now')
+    `).bind(cacheKey).first()
+    
+    if (cached) {
+      return c.json({
+        success: true,
+        data: JSON.parse(cached.response_data),
+        cached: true,
+        cached_at: cached.created_at
+      })
+    }
+  }
+  
+  try {
+    // WebTRIS API - No authentication required!
+    const webtrisUrl = 'http://webtris.nationalhighways.co.uk/api/v1.0/sites'
+    
+    const response = await fetch(webtrisUrl, {
+      headers: {
+        'Accept': 'application/json',
+        'User-Agent': 'HGV-Charging-Site-Selector/1.0'
+      }
+    })
+    
+    if (!response.ok) {
+      throw new Error(`WebTRIS API error: ${response.status} ${response.statusText}`)
+    }
+    
+    const apiData = await response.json()
+    
+    if (!apiData.sites) {
+      throw new Error('Invalid response format from WebTRIS API')
+    }
+    
+    // Transform and filter WebTRIS data (filter first to reduce size)
+    let filteredSites = apiData.sites
+    
+    // Filter by status first (Active sites only by default, or if specified)
+    const requestedStatus = status || 'Active'
+    if (requestedStatus.toLowerCase() !== 'all') {
+      filteredSites = filteredSites.filter((site: any) => 
+        site.Status && site.Status.toLowerCase() === requestedStatus.toLowerCase()
+      )
+    }
+    
+    // Filter by bounds if specified (format: minLat,minLon,maxLat,maxLon)
+    if (bounds) {
+      const [minLat, minLon, maxLat, maxLon] = bounds.split(',').map(parseFloat)
+      filteredSites = filteredSites.filter((site: any) => 
+        site.Latitude >= minLat && site.Latitude <= maxLat &&
+        site.Longitude >= minLon && site.Longitude <= maxLon
+      )
+    }
+    
+    // Now transform the filtered data
+    const transformedData = filteredSites.map((site: any) => {
+      return {
+        site_id: site.Id,
+        name: site.Name || `Site ${site.Id}`,
+        description: site.Description || site.Name,
+        road_name: extractRoadName(site.Description || site.Name),
+        latitude: parseFloat(site.Latitude),
+        longitude: parseFloat(site.Longitude),
+        status: site.Status || 'Unknown',
+        data_source: 'WebTRIS_Live_API',
+        last_updated: new Date().toISOString(),
+        // Placeholder for HGV data (would need separate report call)
+        hgv_aadf: null
+      }
+    }).filter((item: any) => item.latitude && item.longitude)
+    
+    // Only cache if result set is reasonable size (< 5000 sites)
+    if (transformedData.length < 5000) {
+      await db.prepare(`
+        INSERT OR REPLACE INTO api_cache (
+          cache_key, api_source, response_data, created_at
+        ) VALUES (?, ?, ?, datetime('now'))
+      `).bind(
+        cacheKey,
+        'WebTRIS',
+        JSON.stringify(transformedData)
+      ).run()
+    }
+    
+    return c.json({
+      success: true,
+      data: transformedData,
+      cached: false,
+      count: transformedData.length,
+      total: apiData.row_count || transformedData.length,
+      source: 'National Highways WebTRIS',
+      api_url: webtrisUrl
+    })
+    
+  } catch (error: any) {
+    console.error('Error fetching WebTRIS data:', error)
+    return c.json({
+      success: false,
+      error: error.message,
+      fallback: 'Using cached or seed data'
+    }, 500)
+  }
+})
+
+/**
+ * GET /api/traffic-sites/live
+ * Combined endpoint that fetches from WebTRIS and local database
+ */
+app.get('/api/traffic-sites/live', async (c) => {
+  const db = c.env.DB
+  const { bounds, minHGV, status } = c.req.query()
+  
+  try {
+    // Fetch from WebTRIS
+    const baseUrl = c.req.url.replace('/api/traffic-sites/live', '')
+    const queryString = new URLSearchParams(c.req.query() as any).toString()
+    
+    const webtrisResponse = await fetch(`${baseUrl}/api/external/webtris/sites?${queryString}`).catch(() => null)
+    const webtrisData = webtrisResponse ? await webtrisResponse.json() : { success: false, data: [] }
+    
+    // Combine with local database traffic sites
+    let query = 'SELECT * FROM traffic_sites WHERE 1=1'
+    const params: any[] = []
+    
+    if (minHGV) {
+      query += ' AND hgv_aadf >= ?'
+      params.push(parseInt(minHGV))
+    }
+    
+    const dbResult = await db.prepare(query).bind(...params).all()
+    
+    // Merge all results
+    const allTrafficSites = [
+      ...(webtrisData.success ? webtrisData.data : []),
+      ...(dbResult.results || [])
+    ]
+    
+    return c.json({
+      success: true,
+      data: allTrafficSites,
+      count: allTrafficSites.length,
+      sources: {
+        webtris_live: webtrisData.success ? webtrisData.data.length : 0,
+        database: dbResult.results?.length || 0
+      }
+    })
+    
+  } catch (error: any) {
+    // Fallback to database only
+    let query = 'SELECT * FROM traffic_sites WHERE 1=1'
+    const params: any[] = []
+    
+    if (minHGV) {
+      query += ' AND hgv_aadf >= ?'
+      params.push(parseInt(minHGV))
+    }
+    
+    const result = await db.prepare(query).bind(...params).all()
+    
+    return c.json({
+      success: true,
+      data: result.results,
+      count: result.results?.length || 0,
+      fallback: true,
+      error: error.message
+    })
+  }
+})
+
+// Helper function to extract road name from site description
+function extractRoadName(description: string): string {
+  const match = description.match(/^([AM]\d+(?:\/[0-9A-Z]+)?)/i)
+  return match ? match[1] : 'Unknown'
+}
 
 // ============================================================================
 // FRONTEND ROUTE
